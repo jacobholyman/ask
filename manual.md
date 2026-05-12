@@ -12,7 +12,7 @@
 | llama.cpp 빌드 | `~/src/llama.cpp/build/bin/` | CUDA sm_120, Flash Attention |
 | 모델 디렉토리 | `~/models/<model-name>/` | 여러 GGUF 모델 |
 | systemd 서비스 | `~/.config/systemd/user/llama-server.service` | 자동 시작 |
-| `ask` bash 함수 | `~/.bashrc` | 터미널 호출 + 모델 관리 |
+| `ask` 실행 스크립트 | `~/Code/Claude/ask/ask` (PATH 등록) | 터미널 호출 + 모델 관리 |
 | `askmanual` alias | `~/.bashrc` | 이 문서 페이저 보기 (glow 필요) |
 | HTTP 엔드포인트 | `http://127.0.0.1:8080` | OpenAI 호환 API |
 
