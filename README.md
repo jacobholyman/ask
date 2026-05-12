@@ -88,6 +88,13 @@ askmanual         # 매뉴얼 페이저로 보기 (glow 필요)
 | `~/.cache/ask/model_ctx.json` | 모델별 ctx-size 저장값 |
 | `~/.cache/ask/config.json` | 전역 설정 (`--limit` 등) |
 
+## 알려진 한계
+
+- **모델 디렉토리 경로 고정**: `ask` 본체에 `~/models/` 가 박혀 있어 다른 위치로 바꿀 수 없습니다. `install.sh`도 `~/models/` 로 강제합니다. 추후 환경변수화 예정.
+- **Ubuntu/Debian 외 배포판**: `install.sh`는 `apt`를 사용합니다. Fedora/Arch 등에서는 의존성 설치(`dnf`/`pacman`)와 일부 명령을 직접 수정해야 합니다.
+- **`install.sh` 검증 상태**: 작성자 본인 환경에서 아직 한 번도 실행되지 않은 초기 버전입니다. 처음 돌릴 때 문제가 있을 수 있으니, 이상 발생 시 [Issues](https://github.com/jacobholyman/ask/issues)에 환경(OS 버전, GPU, 에러 메시지)과 함께 알려주세요.
+- **macOS 미지원**: `systemd` 의존이라 macOS는 작동하지 않습니다.
+
 ## 개발 환경 (참고)
 
 - Ubuntu
