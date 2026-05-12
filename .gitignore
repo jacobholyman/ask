@@ -1,0 +1,14 @@
+# 개인 작업 흔적은 공개 저장소에 올리지 않는다
+.claude/
+.session_archive/
+session_handoff.md
+log/
+report/
+
+# OS / 에디터 임시 파일
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
