@@ -8,17 +8,45 @@ llama.cpp 로컬 LLM 서버를 터미널에서 빠르게 호출하기 위한 단
 
 ## 빠른 시작
 
+### 사전 조건 (직접 준비)
+
+이 도구는 **이미 빌드된 `llama-server` 바이너리**를 호출합니다. 빌드는 GPU/CUDA 환경에 따라 천차만별이라 자동화하지 않습니다.
+
+- llama.cpp 빌드 가이드: <https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md>
+- 빌드 결과 위치 (기본 가정): `~/src/llama.cpp/build/bin/llama-server`
+
+### 설치 (자동)
+
 ```bash
 # 1. 저장소 받기
 git clone git@github.com:jacobholyman/ask.git ~/Code/Claude/ask
+cd ~/Code/Claude/ask
 
-# 2. PATH 등록 (~/.bashrc 또는 ~/.zshrc)
-echo 'export PATH="$HOME/Code/Claude/ask:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+# 2. 자동 설치 스크립트 실행 (Ubuntu/Debian)
+./install.sh
+```
 
-# 3. 사용
+`install.sh`가 다음을 자동 처리합니다:
+
+1. 의존성 확인/설치 (`jq`, `curl`, `python3-rich`, 선택: `glow`, `huggingface-cli`)
+2. `llama-server` 위치 확인
+3. 모델 디렉토리(`~/models/`) 생성
+4. `systemd` 사용자 서비스 파일 자동 생성 (`~/.config/systemd/user/llama-server.service`)
+5. 첫 모델 다운로드 (선택: Qwen3-4B / Qwen3-9B / Gemma-27B / 건너뛰기)
+6. 서비스 시작 + 작동 검증
+7. `~/.bashrc`에 PATH 자동 등록 (선택)
+
+### 수동 설치
+
+`install.sh`를 쓰지 않으려면 위 1~7번을 직접 수행하면 됩니다. 서비스 파일 예시는 [`manual.md`](./manual.md) 참고.
+
+### 사용
+
+```bash
 ask "안녕"
 ask --help
+ask -l            # 모델 목록 + 전환
+askmanual         # 매뉴얼 페이저로 보기 (glow 필요)
 ```
 
 ## 의존성
