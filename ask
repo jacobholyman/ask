@@ -1,0 +1,925 @@
+#!/usr/bin/env bash
+# ask - llama-server 빠른 호출 스크립트
+# 추출 위치: ~/.bashrc 라인 143~1060 (2026-05-13 분리)
+
+# llama-server 빠른 호출 함수
+# 사용법:
+#   ask "질문"                  -> 답변 + 마크다운 렌더링 (기본)
+#   ask -raw "질문"             -> raw 스트리밍 (마크다운 변환 없음)
+#   ask -v "질문"               -> thinking까지 표시
+#   echo "질문" | ask           -> 파이프 입력
+#   ask "긴 질문" -m 4000      -> max_tokens 지정
+#   ask -l                      -> 설치된 모델 목록 + 인터랙티브 선택/전환
+#   ask -L                      -> 목록만 출력 (선택 없음)
+
+# 재source 시 alias 확장으로 인한 syntax error 방지
+unalias ask 2>/dev/null
+
+# ask 함수 군 공용 상수 (사용자가 .bashrc에서 직접 수정 가능)
+# _ASK_CFG_* prefix는 ask() 함수의 local 선언 대상이 아니므로 보존됨
+: "${_ASK_CFG_VRAM_THRESHOLD_GB:=22}"   # 이 크기(GB) 이상 모델은 더 작은 ctx 사용
+: "${_ASK_CFG_CTX_LARGE:=262144}"        # 학습 ctx 한계 (256K)
+: "${_ASK_CFG_CTX_SMALL:=131072}"        # 큰 모델용 safe ctx (128K)
+: "${_ASK_CFG_DEFAULT_QUANT:=Q4_K_M}"    # -i 옵션 기본 quant
+
+ask() {
+  local verbose=0 max_tokens=2000 prompt="" mode="ask"
+  # 모든 _ASK_* 임시 변수를 local로 잡아 함수 종료 시 자동 정리 (전역 누수 차단)
+  # _ASK_MD=1이 기본: 마크다운 렌더링. -raw 플래그로 끔.
+  local _ASK_RESET=0 _ASK_ONCE=0 _ASK_MD=1
+  local _ASK_LIMIT="" _ASK_CTX="" _ASK_REPO="" _ASK_QUANT="" _ASK_QUERY="" _ASK_SYS="" _ASK_RM=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -v|--verbose) verbose=1; shift ;;
+      -m|--max-tokens) max_tokens="$2"; shift 2 ;;
+      -l|--list) mode="select"; shift; break ;;
+      -L|--list-only) mode="list"; shift; break ;;
+      -s|--search) mode="search"; shift; _ASK_QUERY="$*"; break ;;
+      -i|--install)
+        mode="install"; shift
+        _ASK_REPO="${1:-}"; _ASK_QUANT="${2:-$_ASK_CFG_DEFAULT_QUANT}"
+        [ $# -gt 0 ] && shift
+        [ $# -gt 0 ] && shift
+        break ;;
+      --rm|--remove)
+        mode="rm"; shift
+        _ASK_RM="${1:-}"
+        [ $# -gt 0 ] && shift
+        break ;;
+      -r|--reset) _ASK_RESET=1; shift ;;
+      -1|--once) _ASK_ONCE=1; shift ;;
+      -raw|--raw) _ASK_MD=0; shift ;;
+      --history|--show) mode="history"; shift; break ;;
+      --limit)
+        shift
+        if [ $# -eq 0 ] || [[ "$1" == -* ]]; then
+          mode="show_limit"
+        else
+          mode="set_limit"
+          _ASK_LIMIT="$1"
+          shift
+        fi
+        break ;;
+      --set-ctx)
+        shift
+        if [ $# -eq 0 ] || [[ "$1" == -* ]]; then
+          echo "사용법: ask --set-ctx N (N은 토큰 수, 예: 131072)"
+          return 1
+        fi
+        mode="set_ctx"
+        _ASK_CTX="$1"
+        shift
+        break ;;
+      --show-ctx) mode="show_ctx"; shift; break ;;
+      --list-ctx) mode="list_ctx"; shift; break ;;
+      -S|--sys)
+        shift
+        if [ $# -eq 0 ] || [[ "$1" == -* ]]; then
+          mode="show_sys"
+        else
+          mode="set_sys"
+          _ASK_SYS="$*"
+        fi
+        break ;;
+      --sys-clear) mode="clear_sys"; shift; break ;;
+      --sys-list) mode="list_sys"; shift; break ;;
+      -h|--help) mode="help"; shift; break ;;
+      *) prompt+="${prompt:+ }$1"; shift ;;
+    esac
+  done
+
+  if [ "$mode" = "help" ]; then
+    cat <<'EOF'
+ask - llama-server (OpenAI 호환 API) 호출 함수
+
+질문 (대화 히스토리 자동 유지):
+  ask "질문"                 이전 대화를 기억하면서 응답 (기본)
+  ask -v "질문"              thinking 과정도 표시
+  ask -m 4000 "질문"         max_tokens 지정 (기본 2000)
+  echo "질문" | ask           파이프만 입력 (질문이 stdin에서 옴)
+  cat file | ask "지시"       인자(지시) + 파이프(자료) 결합
+                             -> "지시\n\n<파일내용>" 으로 전송
+
+대화 히스토리 관리:
+  ask -1 "질문"              이번만 단발 (이전 기억 안 읽고, 이번 Q/A도 안 저장)
+  ask -r                     히스토리 초기화 (질문 없이)
+  ask -r "질문"              초기화 후 새 질문
+  ask --history              현재 저장된 대화 보기 (--show 동일)
+  ask --limit                현재 한도 보기 (기본: 무제한)
+  ask --limit N              수동 설정 (메시지 N개 = N/2 턴)
+  ask --limit 0              무제한으로 복귀
+  ※ 1턴 = 유저 질문 1개 + 모델 답변 1개 = 2개 메시지
+  ※ 기본 무제한 — 매 응답에 ctx 사용량 표시, 'ask -r'로 직접 초기화
+  ※ 모델 전환 시 히스토리 자동 초기화 (모델별로 따로 기억 안 함)
+
+출력 형식:
+  ask "질문"                 기본: 마크다운 렌더링 (rich 사용, 버퍼 후 출력)
+  ask -raw "질문"            raw 스트리밍 (마크다운 변환 없이 모델 출력 그대로)
+  (모든 응답 끝에 응답시간/ctx 사용량 표시)
+
+시스템 프롬프트 (모델별 저장):
+  ask -S "프롬프트"           현재 활성 모델의 시스템 프롬프트 설정
+  ask -S                     현재 모델의 시스템 프롬프트 보기
+  ask --sys-clear            현재 모델의 시스템 프롬프트 제거
+  ask --sys-list             모든 모델의 시스템 프롬프트 목록
+
+컨텍스트 크기 (모델별 저장, 모델 전환 시 자동 적용):
+  ask --show-ctx             현재 모델의 ctx-size
+  ask --set-ctx N            현재 모델의 ctx-size 변경 (재시작 동반)
+  ask --list-ctx             모든 모델의 ctx 설정 + 자동 기본값
+
+모델 관리:
+  ask -l                     설치된 모델 목록 + 선택 전환
+  ask -L                     목록만 출력
+  ask -s <키워드>             HuggingFace에서 GGUF repo 검색
+  ask -i <repo> [<quant>]    HF에서 모델 다운로드 + 설치
+                             기본 quant: Q4_K_M
+                             (변경: export _ASK_CFG_DEFAULT_QUANT=Q5_K_M)
+                             예: ask -i unsloth/gemma-4-31B-it-GGUF
+                             예: ask -i unsloth/gemma-4-31B-it-GGUF Q5_K_M
+  ask --rm <model-name>      설치된 모델 삭제
+
+  ask -h                     이 도움말
+
+저장 위치:
+  ~/.cache/ask/history.json          현재 모델의 대화 히스토리
+  ~/.cache/ask/system_prompts.json   모델별 시스템 프롬프트
+  ~/.cache/ask/model_ctx.json        모델별 ctx-size 저장값
+  ~/.cache/ask/config.json           --limit 등 전역 설정
+  ~/.cache/ask/.last_model           직전 활성 모델 (변경 감지용)
+
+기본 동작 요약:
+  - 히스토리 한도: 기본 무제한 (ctx-size까지 누적). --limit N 으로 강제 제한
+  - 모델 전환 / 시스템 프롬프트 변경 시 히스토리 자동 초기화
+  - --ctx-size 자동 결정: 22GB 미만 모델 = 262144, 이상 = 131072 (--set-ctx로 덮어쓰기)
+EOF
+    return 0
+  fi
+
+  if [ "$mode" = "history" ]; then
+    local hf=~/.cache/ask/history.json
+    if [ ! -s "$hf" ]; then
+      echo "(히스토리 비어있음)"
+      return 0
+    fi
+    jq -r '.[] | "[1m[\(.role)][0m \(.content)\n"' "$hf"
+    return 0
+  fi
+
+  if [ "$mode" = "set_sys" ]; then _ask_set_system "$_ASK_SYS"; return $?; fi
+  if [ "$mode" = "show_sys" ]; then _ask_show_system; return 0; fi
+  if [ "$mode" = "clear_sys" ]; then _ask_clear_system; return $?; fi
+  if [ "$mode" = "list_sys" ]; then _ask_list_system; return 0; fi
+
+  if [ "$mode" = "show_limit" ]; then
+    local saved
+    saved=$(_ask_config_get history_limit 0)
+    if [ "${saved:-0}" -gt 0 ]; then
+      echo "현재 히스토리 한도: $saved개 ($(($saved/2))턴) [수동]"
+      echo "무제한으로 복귀: ask --limit 0  (또는 auto)"
+    else
+      echo "현재 히스토리 한도: 무제한 (기본)"
+      echo "  -> ctx-size 한도까지 누적, 매 응답에 ctx 사용량 표시됨"
+      echo "  -> 'ask -r' 로 수동 초기화"
+      echo "수동 제한: ask --limit N"
+    fi
+    return 0
+  fi
+  if [ "$mode" = "set_limit" ]; then
+    if [ "$_ASK_LIMIT" = "auto" ] || [ "$_ASK_LIMIT" = "0" ]; then
+      _ask_config_set history_limit 0
+      echo "[OK] 히스토리 한도: 무제한 (ctx 한도까지 누적)"
+      return 0
+    fi
+    if ! [[ "$_ASK_LIMIT" =~ ^[0-9]+$ ]] || [ "$_ASK_LIMIT" -lt 2 ]; then
+      echo "[FAIL] 2 이상의 숫자 또는 'auto'/0 (예: ask --limit 40)"
+      return 1
+    fi
+    _ask_config_set history_limit "$_ASK_LIMIT"
+    echo "[OK] 히스토리 한도: $_ASK_LIMIT개 메시지 ($(($_ASK_LIMIT/2))턴) [수동]"
+    return 0
+  fi
+
+  if [ "$mode" = "show_ctx" ]; then _ask_show_ctx; return 0; fi
+  if [ "$mode" = "set_ctx" ]; then _ask_set_ctx "$_ASK_CTX"; return $?; fi
+  if [ "$mode" = "list_ctx" ]; then _ask_list_ctx; return 0; fi
+
+  if [ "$mode" = "search" ]; then
+    _ask_search "$_ASK_QUERY"
+    return $?
+  fi
+
+  if [ "$mode" = "install" ]; then
+    _ask_install "$_ASK_REPO" "$_ASK_QUANT"
+    return $?
+  fi
+
+  if [ "$mode" = "rm" ]; then
+    _ask_remove "$_ASK_RM"
+    return $?
+  fi
+
+  if [ "$mode" = "list" ] || [ "$mode" = "select" ]; then
+    local -a _model_names _model_paths
+    _ask_list_models _model_names _model_paths
+    [ "$mode" = "list" ] && return 0
+    echo ""
+    read -p "전환할 번호 (Enter=취소): " choice
+    [ -z "$choice" ] && return 0
+    _ask_switch_by_number "$choice" _model_names _model_paths
+    return $?
+  fi
+
+  # 히스토리 파일 경로
+  local hist_dir=~/.cache/ask
+  local hist_file="$hist_dir/history.json"
+  mkdir -p "$hist_dir"
+  [ ! -f "$hist_file" ] && echo "[]" > "$hist_file"
+
+  # --reset 처리 (_ASK_RESET은 local이라 함수 종료 시 자동 정리됨)
+  if [ "${_ASK_RESET:-0}" -eq 1 ]; then
+    echo "[]" > "$hist_file"
+    echo "[OK] 히스토리 초기화"
+    [ -z "$prompt" ] && return 0
+  fi
+
+  # 일반 질문 모드
+  # stdin이 파이프/리다이렉트로 들어왔으면 흡수 (터미널이면 안 읽음)
+  local stdin_data=""
+  if [ ! -t 0 ]; then
+    stdin_data=$(cat)
+  fi
+  # 인자(prompt) + stdin 결합 규칙:
+  #   - 인자만: 인자
+  #   - stdin만: stdin
+  #   - 둘 다: "인자\n\nstdin" (인자=지시, stdin=자료)
+  if [ -n "$stdin_data" ]; then
+    if [ -n "$prompt" ]; then
+      prompt="${prompt}"$'\n\n'"${stdin_data}"
+    else
+      prompt="$stdin_data"
+    fi
+  fi
+  [[ -z "$prompt" ]] && { echo "사용법: ask \"질문\" | ask -h (도움말)"; return 1; }
+
+  # 현재 활성 모델 alias를 systemd 서비스 파일에서 동적으로 가져옴
+  local svc=~/.config/systemd/user/llama-server.service
+  local model_alias
+  model_alias=$(grep -oP -- '--alias\s+\K\S+' "$svc" 2>/dev/null)
+  model_alias="${model_alias:-default}"
+
+  # 모델 변경 감지 (모델 바뀌면 히스토리 무효)
+  local model_marker_file="$hist_dir/.last_model"
+  local last_model=""
+  [ -f "$model_marker_file" ] && last_model=$(cat "$model_marker_file")
+  if [ "$last_model" != "$model_alias" ]; then
+    echo "[]" > "$hist_file"
+    echo "$model_alias" > "$model_marker_file"
+  fi
+
+  # 시스템 프롬프트 (모델별 저장된 거)
+  local sys_file=~/.cache/ask/system_prompts.json
+  local sys_msg=""
+  [ -f "$sys_file" ] && sys_msg=$(jq -r --arg m "$model_alias" '.[$m] // ""' "$sys_file")
+
+  # messages 배열 구성: [system?] + [history?] + 새 질문
+  local messages
+  if [ "${_ASK_ONCE:-0}" -eq 1 ]; then
+    if [ -n "$sys_msg" ]; then
+      messages=$(jq -n --arg s "$sys_msg" --arg p "$prompt" \
+        '[{role:"system", content:$s}, {role:"user", content:$p}]')
+    else
+      messages=$(jq -n --arg p "$prompt" '[{role:"user", content:$p}]')
+    fi
+  else
+    if [ -n "$sys_msg" ]; then
+      messages=$(jq --arg s "$sys_msg" --arg p "$prompt" \
+        '[{role:"system", content:$s}] + . + [{role:"user", content:$p}]' "$hist_file")
+    else
+      messages=$(jq --arg p "$prompt" '. + [{role:"user", content:$p}]' "$hist_file")
+    fi
+  fi
+  # _ASK_ONCE는 라인 아래쪽 히스토리 저장 분기에서 다시 참조하므로 unset 금지
+  # (local 변수라 함수 종료 시 자동 정리됨)
+
+  local payload
+  payload=$(jq -n \
+    --argjson msgs "$messages" \
+    --arg m "$model_alias" \
+    --argjson mt "$max_tokens" \
+    '{model:$m, messages:$msgs, max_tokens:$mt, stream:true,
+      stream_options:{include_usage:true}}')
+
+  # 응답 캡처 파일
+  local capture_file="$hist_dir/.last_response"
+  : > "$capture_file"
+  local start_time
+  start_time=$(date +%s.%N)
+
+  # 터미널 폭 + 현재 ctx-size 자식에 전달
+  local _term_cols _ctx_size
+  _term_cols=$(tput cols 2>/dev/null || echo 120)
+  _ctx_size=$(grep -oP -- '--ctx-size\s+\K\d+' "$svc" 2>/dev/null || echo 0)
+
+  curl -N -s http://127.0.0.1:8080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "$payload" | \
+  VERBOSE=$verbose CAPTURE="$capture_file" MARKDOWN="${_ASK_MD:-0}" \
+  START_TIME="$start_time" COLUMNS="$_term_cols" CTX_SIZE="$_ctx_size" python3 -c '
+import sys, os, json, time, subprocess
+verbose = os.environ.get("VERBOSE") == "1"
+markdown = os.environ.get("MARKDOWN") == "1"
+capture = os.environ.get("CAPTURE", "")
+start = float(os.environ.get("START_TIME", "0") or "0")
+ctx_size = int(os.environ.get("CTX_SIZE", "0") or "0")
+state = "init"
+DIM = "\033[2m\033[90m"; RST = "\033[0m"; BOLD = "\033[1m"
+content_buf = []
+n_dots = 0
+usage_info = None  # 마지막 chunk의 usage 저장
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("data: "): continue
+    data = line[6:]
+    if data == "[DONE]": break
+    try:
+        chunk = json.loads(data)
+    except Exception:
+        continue
+    # usage chunk (마지막에 옴, choices가 비어있을 수도)
+    if chunk.get("usage"):
+        usage_info = chunk["usage"]
+    # delta 처리
+    choices = chunk.get("choices") or []
+    if not choices: continue
+    d = choices[0].get("delta") or {}
+    rc = d.get("reasoning_content") or ""
+    c  = d.get("content") or ""
+    if rc and verbose:
+        if state != "thinking":
+            print(f"{DIM}[think] ", end="", flush=True); state = "thinking"
+        print(rc, end="", flush=True)
+    if c:
+        content_buf.append(c)
+        if markdown:
+            n_dots += 1
+            if n_dots % 10 == 0:
+                print(f"{DIM}.{RST}", end="", flush=True, file=sys.stderr)
+        else:
+            if state == "thinking":
+                print(f"{RST}\n\n{BOLD}[answer]{RST} ", end="", flush=True)
+            state = "answering"
+            print(c, end="", flush=True)
+
+elapsed = time.time() - start if start > 0 else 0
+full = "".join(content_buf)
+
+# Markdown 모드: rich로 렌더링 (Python 라이브러리, 헤더/표/코드 깔끔)
+if markdown and full:
+    if n_dots > 0: print("", flush=True, file=sys.stderr)  # 줄바꿈
+    try:
+        import shutil
+        cols = shutil.get_terminal_size((120, 24)).columns
+        try:
+            env_cols = int(os.environ.get("COLUMNS", "0"))
+            if env_cols > 0: cols = env_cols
+        except: pass
+        from rich.console import Console
+        from rich.markdown import Markdown
+        Console(width=cols, force_terminal=True).print(Markdown(full))
+    except ImportError:
+        # rich 없으면 glow로 fallback
+        try:
+            subprocess.run(["glow", "-w", str(cols), "-"],
+                           input=full, text=True, check=False)
+        except FileNotFoundError:
+            print(f"{DIM}(rich/glow 미설치 -> raw 출력){RST}", file=sys.stderr)
+            print(full)
+else:
+    print(RST)
+
+# 응답 시간 / 통계 + ctx 사용량
+if elapsed > 0:
+    char_n = len(full)
+    char_rate = char_n / elapsed if elapsed > 0 else 0
+    line = f"[⏱  {elapsed:.1f}s · {char_n}자 · {char_rate:.0f}자/s"
+    # ctx 사용량 표시
+    if usage_info and ctx_size > 0:
+        prompt_tok = usage_info.get("prompt_tokens", 0)
+        gen_tok = usage_info.get("completion_tokens", 0)
+        total = usage_info.get("total_tokens", prompt_tok + gen_tok)
+        free_pct = 100 * (1 - total / ctx_size)
+        # 색상: 80%+ 사용 시 노란색, 90%+ 빨간색
+        used_pct = 100 - free_pct
+        if used_pct >= 90:
+            ctx_color = "\033[1;31m"  # bold red
+        elif used_pct >= 70:
+            ctx_color = "\033[1;33m"  # bold yellow
+        else:
+            ctx_color = "\033[2;90m"  # dim gray
+        line += f" · ctx: {ctx_color}{total:,}/{ctx_size:,} ({free_pct:.0f}% free){DIM}"
+    elif usage_info:
+        # ctx_size 모를 때
+        total = usage_info.get("total_tokens", 0)
+        line += f" · ctx: {total:,} tok"
+    line += "]"
+    print(f"{DIM}{line}{RST}", file=sys.stderr)
+
+if capture:
+    with open(capture, "w") as f:
+        f.write(full)
+'
+
+  # 히스토리 업데이트 (--once 아닌 경우만)
+  if [ "${_ASK_ONCE:-0}" != "1" ] && [ -s "$capture_file" ]; then
+    local response
+    response=$(cat "$capture_file")
+    local hist_limit
+    hist_limit=$(_ask_effective_limit)
+    if [ "${hist_limit:-0}" -le 0 ]; then
+      # 무제한: 전부 유지
+      jq --arg p "$prompt" --arg r "$response" \
+        '. + [{role:"user", content:$p}, {role:"assistant", content:$r}]' \
+        "$hist_file" > "$hist_file.tmp" && mv "$hist_file.tmp" "$hist_file"
+    else
+      # 수동 제한
+      jq --arg p "$prompt" --arg r "$response" --argjson lim "$hist_limit" \
+        '. + [{role:"user", content:$p}, {role:"assistant", content:$r}] | .[(-$lim):]' \
+        "$hist_file" > "$hist_file.tmp" && mv "$hist_file.tmp" "$hist_file"
+    fi
+  fi
+  # _ASK_MD는 local이라 함수 종료 시 자동 정리됨
+}
+
+# 모델 목록 + 활성 표시
+# 모델 목록 출력 + (선택) 호출자의 배열에 결과 저장
+# 사용: _ask_list_models [out_names_var [out_paths_var]]
+# 인자 없이 호출하면 출력만, 두 인자 전달 시 nameref로 결과 빌드 (전역 누수 없음)
+_ask_list_models() {
+  local svc=~/.config/systemd/user/llama-server.service
+  local current_path
+  current_path=$(grep -oP -- '--model\s+\K\S+' "$svc" 2>/dev/null)
+
+  local -a names paths sizes
+  while IFS= read -r dir; do
+    [ -d "$dir" ] || continue
+    local name=$(basename "$dir")
+    local gguf
+    gguf=$(find "$dir" -maxdepth 1 -name "*.gguf" 2>/dev/null | head -1)
+    [ -z "$gguf" ] && continue
+    names+=("$name")
+    paths+=("$gguf")
+    sizes+=("$(numfmt --to=iec --suffix=B "$(stat -c %s "$gguf")")")
+  done < <(ls -d ~/models/*/ 2>/dev/null)
+
+  if [ ${#names[@]} -eq 0 ]; then
+    echo "~/models/ 아래 GGUF 파일이 없습니다"
+    return 1
+  fi
+
+  echo "=== 설치된 모델 ==="
+  for i in "${!names[@]}"; do
+    local marker="  "
+    [ "${paths[$i]}" = "$current_path" ] && marker="[*] "
+    printf " [%d] %s%-25s %s\n" "$((i+1))" "$marker" "${names[$i]}" "${sizes[$i]}"
+  done
+  echo ""
+  echo " [*] = 현재 활성"
+
+  # 호출자가 nameref로 두 배열 받기 원하면 채움 (전역 변수 누수 없음)
+  if [ -n "${1:-}" ]; then
+    local -n _out_names_ref=$1
+    _out_names_ref=("${names[@]}")
+  fi
+  if [ -n "${2:-}" ]; then
+    local -n _out_paths_ref=$2
+    _out_paths_ref=("${paths[@]}")
+  fi
+}
+
+# 히스토리 limit
+# 기본: 무제한 (0). 매 응답마다 ctx 사용량 표시하니 사용자가 'ask -r'로 수동 초기화
+# 수동 설정: ask --limit N으로 강제 제한 가능
+_ask_effective_limit() {
+  local saved
+  saved=$(_ask_config_get history_limit 0)
+  echo "${saved:-0}"   # 0 = 무제한
+}
+
+# 모델 크기 기반 적정 ctx 자동 결정
+# 가정: RTX 5090 32GB, KV cache q8_0, 다른 GPU 작업 없음, VRAM 여유 최소
+# 기본은 학습 ctx 한계(262144 = 256K) 시도 -> 너무 크면 ask --set-ctx로 낮춤
+_ask_default_ctx() {
+  local model_name="$1"
+  local gguf
+  gguf=$(find ~/models/"$model_name" -maxdepth 1 -name "*.gguf" 2>/dev/null | head -1)
+  [ -z "$gguf" ] && { echo "32768"; return; }
+  local size_gb=$(( $(stat -c %s "$gguf") / 1073741824 ))
+  # 모델 크기별 ctx 결정 (상수는 .bashrc 상단의 _ASK_CFG_* 에서 정의)
+  if [ $size_gb -lt "$_ASK_CFG_VRAM_THRESHOLD_GB" ]; then
+    echo "$_ASK_CFG_CTX_LARGE"
+  else
+    echo "$_ASK_CFG_CTX_SMALL"
+  fi
+}
+
+# 모델별 저장된 ctx (없으면 자동 결정)
+_ask_get_model_ctx() {
+  local model="$1"
+  local cfg=~/.cache/ask/model_ctx.json
+  mkdir -p ~/.cache/ask
+  [ ! -f "$cfg" ] && echo "{}" > "$cfg"
+  local saved
+  saved=$(jq -r --arg m "$model" '.[$m] // empty' "$cfg" 2>/dev/null)
+  [ -n "$saved" ] && echo "$saved" || _ask_default_ctx "$model"
+}
+
+# 모델별 ctx 저장 (영구)
+_ask_set_model_ctx() {
+  local model="$1" ctx="$2"
+  local cfg=~/.cache/ask/model_ctx.json
+  mkdir -p ~/.cache/ask
+  [ ! -f "$cfg" ] && echo "{}" > "$cfg"
+  jq --arg m "$model" --argjson c "$ctx" '.[$m] = $c' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+}
+
+# Config 파일에서 값 읽기
+_ask_config_get() {
+  local key="$1" default="$2"
+  local f=~/.cache/ask/config.json
+  [ ! -f "$f" ] && { echo "$default"; return; }
+  local val
+  val=$(jq -r --arg k "$key" '.[$k] // empty' "$f" 2>/dev/null)
+  [ -z "$val" ] && echo "$default" || echo "$val"
+}
+
+# Config 파일에 값 쓰기 (숫자 자동 감지)
+_ask_config_set() {
+  local key="$1" val="$2"
+  local f=~/.cache/ask/config.json
+  mkdir -p ~/.cache/ask
+  [ ! -f "$f" ] && echo "{}" > "$f"
+  if [[ "$val" =~ ^[0-9]+$ ]]; then
+    jq --arg k "$key" --argjson v "$val" '.[$k] = $v' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  else
+    jq --arg k "$key" --arg v "$val" '.[$k] = $v' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  fi
+}
+
+# 현재 모델 ctx-size 보기 (실제 적용 값 + 저장된 값 + 자동 기본값)
+_ask_show_ctx() {
+  local model
+  model=$(_ask_current_alias)
+  local svc=~/.config/systemd/user/llama-server.service
+  local applied
+  applied=$(grep -oP -- '--ctx-size\s+\K\d+' "$svc")
+  local default
+  default=$(_ask_default_ctx "$model")
+  local saved
+  saved=$(jq -r --arg m "$model" '.[$m] // empty' ~/.cache/ask/model_ctx.json 2>/dev/null)
+  echo "[$model]"
+  echo "  적용 중:    $applied 토큰"
+  echo "  저장된 값:  ${saved:-(없음)}"
+  echo "  자동 기본:  $default"
+  echo ""
+  echo "변경: ask --set-ctx N"
+}
+
+# 현재 모델의 ctx 저장 + 즉시 재시작 적용
+_ask_set_ctx() {
+  local ctx="$1"
+  if ! [[ "$ctx" =~ ^[0-9]+$ ]] || [ "$ctx" -lt 512 ]; then
+    echo "[FAIL] 512 이상의 숫자 (예: 32768, 131072, 262144)"
+    return 1
+  fi
+  local model
+  model=$(_ask_current_alias)
+  _ask_set_model_ctx "$model" "$ctx"
+  echo "[OK] [$model] ctx-size 저장: $ctx 토큰"
+
+  # systemd 서비스 파일 즉시 갱신 + 재시작
+  local svc=~/.config/systemd/user/llama-server.service
+  sed -i "s|--ctx-size [0-9]*|--ctx-size $ctx|" "$svc"
+  systemctl --user daemon-reload
+  systemctl --user restart llama-server.service
+  echo "  -> 서비스 재시작 중 (로딩 대기)..."
+  local i=0
+  while ! curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1; do
+    sleep 2; i=$((i+1))
+    if [ $i -gt 60 ]; then
+      echo "[FAIL] 타임아웃 — OOM 가능. 더 작은 값 시도하세요"
+      echo "  서버 상태: $(systemctl --user is-active llama-server.service)"
+      echo "  최근 헬스체크 응답 (curl -v 진단):"
+      curl -v --max-time 3 http://127.0.0.1:8080/health 2>&1 | tail -8 | sed 's/^/    /'
+      echo "  서비스 로그 (최근 15줄):"
+      journalctl --user -u llama-server.service -n 15 --no-pager 2>&1 | sed 's/^/    /'
+      return 1
+    fi
+  done
+  local actual_vram=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+  echo "[OK] 적용 완료 (VRAM 사용: ${actual_vram} MiB)"
+}
+
+# 모든 모델의 ctx 설정 목록
+_ask_list_ctx() {
+  echo "=== 모델별 ctx 설정 ==="
+  local cur
+  cur=$(_ask_current_alias)
+  local cfg=~/.cache/ask/model_ctx.json
+  for dir in ~/models/*/; do
+    [ -d "$dir" ] || continue
+    local name=$(basename "$dir")
+    local gguf
+    gguf=$(find "$dir" -maxdepth 1 -name "*.gguf" 2>/dev/null | head -1)
+    [ -z "$gguf" ] && continue
+    local size_gb=$(( $(stat -c %s "$gguf") / 1073741824 ))
+    local default=$(_ask_default_ctx "$name")
+    local saved=""
+    [ -f "$cfg" ] && saved=$(jq -r --arg m "$name" '.[$m] // empty' "$cfg" 2>/dev/null)
+    local marker="  "
+    [ "$name" = "$cur" ] && marker="* "
+    if [ -n "$saved" ]; then
+      printf " %s%-22s  %2dGB  ctx: %s (저장됨)\n" "$marker" "$name" "$size_gb" "$saved"
+    else
+      printf " %s%-22s  %2dGB  ctx: %s (자동)\n" "$marker" "$name" "$size_gb" "$default"
+    fi
+  done
+  echo ""
+  echo " * = 현재 활성 / 저장됨 = --set-ctx로 명시 설정"
+}
+
+# 시스템 프롬프트 - 현재 활성 모델 alias 가져오기
+_ask_current_alias() {
+  grep -oP -- '--alias\s+\K\S+' ~/.config/systemd/user/llama-server.service 2>/dev/null
+}
+
+# 시스템 프롬프트 파일 보장
+_ask_sys_file() {
+  local f=~/.cache/ask/system_prompts.json
+  mkdir -p ~/.cache/ask
+  [ ! -f "$f" ] && echo "{}" > "$f"
+  echo "$f"
+}
+
+# 시스템 프롬프트 설정
+_ask_set_system() {
+  local prompt="$1"
+  local model
+  model=$(_ask_current_alias)
+  [ -z "$model" ] && { echo "[FAIL] 활성 모델 확인 실패"; return 1; }
+  [ -z "$prompt" ] && { echo "사용법: ask -S \"프롬프트 내용\""; return 1; }
+
+  local f
+  f=$(_ask_sys_file)
+  jq --arg m "$model" --arg p "$prompt" '.[$m] = $p' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  echo "[OK] [$model] 시스템 프롬프트 설정 (${#prompt}자)"
+  # 시스템 프롬프트 변경 시 히스토리 자동 초기화
+  echo "[]" > ~/.cache/ask/history.json
+  echo "  -> 대화 히스토리 초기화됨"
+}
+
+# 현재 모델의 시스템 프롬프트 보기
+_ask_show_system() {
+  local model
+  model=$(_ask_current_alias)
+  local f
+  f=$(_ask_sys_file)
+  local sys
+  sys=$(jq -r --arg m "$model" '.[$m] // ""' "$f")
+  if [ -z "$sys" ]; then
+    echo "[$model] (시스템 프롬프트 없음)"
+    echo "설정: ask -S \"프롬프트 내용\""
+  else
+    echo "=== [$model] 시스템 프롬프트 ==="
+    echo "$sys"
+  fi
+}
+
+# 현재 모델의 시스템 프롬프트 삭제
+_ask_clear_system() {
+  local model
+  model=$(_ask_current_alias)
+  local f
+  f=$(_ask_sys_file)
+  local existed
+  existed=$(jq -r --arg m "$model" 'has($m)' "$f")
+  if [ "$existed" != "true" ]; then
+    echo "[$model] 설정된 시스템 프롬프트 없음"
+    return 0
+  fi
+  jq --arg m "$model" 'del(.[$m])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  echo "[OK] [$model] 시스템 프롬프트 제거"
+  echo "[]" > ~/.cache/ask/history.json
+  echo "  -> 대화 히스토리 초기화됨"
+}
+
+# 모든 모델의 시스템 프롬프트 목록
+_ask_list_system() {
+  local f
+  f=$(_ask_sys_file)
+  local n
+  n=$(jq 'length' "$f")
+  if [ "$n" = "0" ]; then
+    echo "(설정된 시스템 프롬프트 없음)"
+    return 0
+  fi
+  local cur
+  cur=$(_ask_current_alias)
+  echo "=== 모델별 시스템 프롬프트 ($n개) ==="
+  jq -r --arg cur "$cur" 'to_entries | .[] |
+    "\n[" + (if .key == $cur then "* " else "  " end) + .key + "]\n" + .value' "$f"
+  echo ""
+  echo "* = 현재 활성 모델"
+}
+
+# HuggingFace 검색
+_ask_search() {
+  local query="$1"
+  [ -z "$query" ] && { echo "사용법: ask -s <키워드>"; return 1; }
+  echo "=== HuggingFace GGUF repo 검색: '$query' ==="
+  curl -s "https://huggingface.co/api/models?search=${query}&limit=30" | \
+    python3 -c '
+import sys, json
+for m in json.load(sys.stdin):
+    mid = m.get("id", "")
+    if "gguf" in mid.lower():
+        d = m.get("downloads", 0)
+        print(f"  {mid:60s} (DL: {d:,})")
+' | head -20
+  echo ""
+  echo "설치: ask -i <repo>"
+}
+
+# HuggingFace에서 모델 다운로드 + 설치
+_ask_install() {
+  local repo="$1"
+  local quant="${2:-$_ASK_CFG_DEFAULT_QUANT}"
+  [ -z "$repo" ] && { echo "사용법: ask -i <user/repo> [<quant>]"; return 1; }
+
+  # repo 존재 확인
+  echo "[1]  Repo 확인 중: $repo"
+  local code=$(curl -sL -o /dev/null -w "%{http_code}" "https://huggingface.co/api/models/$repo")
+  if [ "$code" != "200" ]; then
+    echo "   [FAIL] Repo 찾을 수 없음 (HTTP $code)"
+    echo "   힌트: ask -s <키워드> 로 검색"
+    return 1
+  fi
+  echo "   [OK] 존재"
+
+  # 파일 찾기
+  echo "[2]  파일 찾는 중 (quant=$quant)..."
+  local target_file
+  if [[ "$quant" == *.gguf ]]; then
+    target_file="$quant"
+  else
+    target_file=$(curl -s "https://huggingface.co/api/models/$repo" | \
+      python3 -c '
+import sys, json
+data = json.load(sys.stdin)
+q = sys.argv[1]
+files = [s["rfilename"] for s in data.get("siblings", []) if s["rfilename"].endswith(".gguf")]
+m = [f for f in files if q in f and "00001-of-" not in f]
+if not m: m = [f for f in files if q.lower() in f.lower()]
+if m:
+    print(m[0])
+elif files:
+    print("AVAILABLE:" + "|".join(files[:15]))
+' "$quant")
+    if [[ "$target_file" == AVAILABLE:* ]]; then
+      echo "   [FAIL] '$quant' 없음. 사용 가능한 파일:"
+      echo "${target_file#AVAILABLE:}" | tr '|' '\n' | sed 's/^/      /'
+      return 1
+    fi
+    [ -z "$target_file" ] && { echo "   [FAIL] GGUF 파일 없음"; return 1; }
+  fi
+  echo "   [OK] $target_file"
+
+  # 디렉토리 이름 (repo의 마지막 + -GGUF 제거 + 소문자)
+  local model_name
+  model_name=$(basename "$repo" | sed -E 's/-?GGUF$//I' | tr '[:upper:]' '[:lower:]')
+  local dest_dir=~/models/"$model_name"
+  local url="https://huggingface.co/$repo/resolve/main/$target_file"
+
+  # 크기 확인
+  echo "[3]  파일 크기 확인 중..."
+  local size_bytes
+  size_bytes=$(curl -sIL "$url" 2>/dev/null | grep -i "^content-length:" | tail -1 | awk '{print $2}' | tr -d '\r')
+  local size_iec=$(numfmt --to=iec ${size_bytes:-0} 2>/dev/null)
+  echo "   크기: ${size_iec:-알수없음}"
+
+  echo ""
+  echo "=== 설치 정보 ==="
+  echo "  모델 이름: $model_name"
+  echo "  대상 경로: $dest_dir/$target_file"
+  echo ""
+  read -p "다운로드 시작? [Y/n]: " confirm
+  [[ "$confirm" =~ ^[nN] ]] && { echo "취소됨"; return 0; }
+
+  mkdir -p "$dest_dir"
+  cd "$dest_dir" || return 1
+
+  echo ""
+  echo "[4]  다운로드 중..."
+  if wget -c --progress=bar:force "$url" -O "$target_file"; then
+    echo ""
+    echo "[OK] 설치 완료: $dest_dir/$target_file"
+    echo ""
+    echo "활성화하려면: ask -l -> 번호 선택"
+  else
+    echo "[FAIL] 다운로드 실패"
+    return 1
+  fi
+}
+
+# 모델 삭제
+_ask_remove() {
+  local name="$1"
+  [ -z "$name" ] && { echo "사용법: ask --rm <model-name>"; return 1; }
+  local dir=~/models/"$name"
+  if [ ! -d "$dir" ]; then
+    echo "[FAIL] 모델 없음: $name"
+    echo "현재 설치된 모델:"
+    ls ~/models/ 2>/dev/null | sed 's/^/  /'
+    return 1
+  fi
+
+  # 활성 모델인지 확인
+  local svc=~/.config/systemd/user/llama-server.service
+  local cur_path
+  cur_path=$(grep -oP -- '--model\s+\K\S+' "$svc" 2>/dev/null)
+  if [[ "$cur_path" == "$dir"/* ]]; then
+    echo "[WARNING]  '$name'은 현재 활성 모델입니다."
+    echo "    먼저 다른 모델로 전환하세요: ask -l"
+    return 1
+  fi
+
+  local size=$(du -sh "$dir" | cut -f1)
+  echo "삭제 대상: $dir ($size)"
+  read -p "정말 삭제? [y/N]: " confirm
+  [[ "$confirm" =~ ^[yY] ]] || { echo "취소됨"; return 0; }
+  rm -rf "$dir"
+  echo "[OK] 삭제 완료"
+}
+
+# 번호로 모델 전환
+# 사용: _ask_switch_by_number <choice> <names_array_var> <paths_array_var>
+# 두 번째/세 번째 인자는 호출자가 보유한 배열의 변수 이름 (nameref로 참조)
+_ask_switch_by_number() {
+  local choice="$1"
+  local -n _names_ref="${2:?names array var name required}"
+  local -n _paths_ref="${3:?paths array var name required}"
+  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+    echo "숫자를 입력하세요"
+    return 1
+  fi
+  local idx=$((choice - 1))
+  if [ $idx -lt 0 ] || [ $idx -ge ${#_names_ref[@]} ]; then
+    echo "잘못된 번호 (1~${#_names_ref[@]})"
+    return 1
+  fi
+  local name="${_names_ref[$idx]}"
+  local path="${_paths_ref[$idx]}"
+
+  local svc=~/.config/systemd/user/llama-server.service
+  local cur_path
+  cur_path=$(grep -oP -- '--model\s+\K\S+' "$svc" 2>/dev/null)
+  if [ "$path" = "$cur_path" ]; then
+    echo "이미 활성 모델입니다 ($name)"
+    return 0
+  fi
+
+  # 새 모델에 맞는 ctx-size 결정 (저장된 값 우선, 없으면 자동 기본)
+  local new_ctx
+  new_ctx=$(_ask_get_model_ctx "$name")
+
+  echo "-> $name 으로 전환 중 (ctx: $new_ctx)..."
+
+  # model + alias + ctx-size 동시 갱신
+  sed -i \
+    -e "s|--model [^ \\\\]*|--model $path|" \
+    -e "s|--alias [^ \\\\]*|--alias $name|" \
+    -e "s|--ctx-size [0-9]*|--ctx-size $new_ctx|" \
+    "$svc"
+
+  systemctl --user daemon-reload
+  systemctl --user restart llama-server.service
+
+  echo "모델 로딩 중... (큰 모델은 30초+)"
+  local i=0
+  while ! curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1; do
+    sleep 2
+    i=$((i+1))
+    if [ $i -gt 60 ]; then
+      echo "[FAIL] 타임아웃. 'systemctl --user status llama-server.service'로 확인"
+      echo "  최근 헬스체크 응답 (curl -v 진단):"
+      curl -v --max-time 3 http://127.0.0.1:8080/health 2>&1 | tail -8 | sed 's/^/    /'
+      echo "  서비스 로그 (최근 15줄):"
+      journalctl --user -u llama-server.service -n 15 --no-pager 2>&1 | sed 's/^/    /'
+      return 1
+    fi
+  done
+  echo "[OK] $name 활성화 완료"
+}
+
+# 스크립트로 호출되면 ask 함수를 실행
+ask "$@"
